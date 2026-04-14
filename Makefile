@@ -1,12 +1,10 @@
-CC = gcc
-CPPFLAGS = $(CDEBUG)
-CFLAGS = -Wall 
-lltop_objects = main.o hooks.o rbtree.o
-
 all: lltop
 
-lltop: $(lltop_objects)
-	$(CC) $(CFLAGS) $^ -o $@ 
+lltop: lltop.py
+	python3 -m PyInstaller --onefile lltop.py
+	cp dist/lltop lltop
+	chmod +x lltop
 
 clean:
-	rm -f lltop $(lltop_objects)
+	rm -f lltop
+	rm -rf build dist lltop.spec
