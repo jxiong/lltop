@@ -10,7 +10,15 @@ import time
 import select
 import termios
 import tty
+import signal
+import multiprocessing as mp
 from collections import defaultdict
+
+
+def default_to_regular(d):
+    if isinstance(d, defaultdict):
+        d = {k: default_to_regular(v) for k, v in d.items()}
+    return d
 
 
 def c_red(text):
@@ -53,10 +61,7 @@ def clear_screen():
     print("\033[H\033[J", end="")
 
 
-SSH_CMD = (
-    "/usr/bin/ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5"
-)
-FANOUT = 32
+SSH_CMD = "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5"
 
 
 def expand_node(node_str):
@@ -141,27 +146,24 @@ def get_servers_from_mountpoint(mountpoint):
             return []
 
         async def do_dedup():
-            sem = asyncio.Semaphore(FANOUT)
-
             async def get_hostname(server):
-                async with sem:
-                    cmd = f"{SSH_CMD} {server} 'uname -n'"
-                    try:
-                        process = await asyncio.create_subprocess_shell(
-                            cmd,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        stdout, stderr = await asyncio.wait_for(
-                            process.communicate(), timeout=10
-                        )
-                        if process.returncode == 0:
-                            hn = stdout.decode("utf-8", errors="ignore").strip()
-                            if hn:
-                                return server, hn
-                    except Exception:
-                        pass
-                    return server, server
+                cmd = f"{SSH_CMD} {server} 'uname -n'"
+                try:
+                    process = await asyncio.create_subprocess_shell(
+                        cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(), timeout=10
+                    )
+                    if process.returncode == 0:
+                        hn = stdout.decode("utf-8", errors="ignore").strip()
+                        if hn:
+                            return server, hn
+                except Exception:
+                    pass
+                return server, server
 
             tasks = [get_hostname(srv) for srv in server_list]
             results = await asyncio.gather(*tasks)
@@ -181,34 +183,108 @@ def get_servers_from_mountpoint(mountpoint):
         return []
 
 
-async def fetch_metrics(server, timeout_sec, sem, params_str):
-    async with sem:
-        cmd = f"{SSH_CMD} {server} 'sudo lctl get_param {params_str} 2>/dev/null'"
+class SSHWorker:
+    def __init__(self, server, ssh_cmd):
+        self.server = server
+        self.ssh_cmd = ssh_cmd
+        self.process = None
+
+    async def connect(self):
+        cmd = f"{self.ssh_cmd} {self.server} bash"
+        self.process = await asyncio.create_subprocess_shell(
+            cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+    async def run_cmd(self, cmd, timeout_sec):
         start_time = time.time()
+        if self.process is None or self.process.returncode is not None:
+            try:
+                await asyncio.wait_for(self.connect(), timeout=10)
+            except Exception as e:
+                return "", time.time() - start_time, f"Connect error: {e}"
+
+        magic_eof = f"__EOF_{time.time()}__"
+        magic_bytes = magic_eof.encode()
+        full_cmd = f"{cmd}; echo {magic_eof}$?\n"
+
         try:
-            process = await asyncio.create_subprocess_shell(
-                cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=timeout_sec + 2
-            )
-            elapsed = time.time() - start_time
-            if process.returncode != 0 and process.returncode not in (124, 2):
-                if not stdout:
-                    err_msg = (
-                        stderr.decode("utf-8", errors="ignore").strip()
-                        or f"Exited with {process.returncode}"
-                    )
-                    return server, "", elapsed, err_msg
-            return server, stdout.decode("utf-8", errors="ignore"), elapsed, None
+            self.process.stdin.write(full_cmd.encode())
+            await self.process.stdin.drain()
+
+            buffer = bytearray()
+            while True:
+                chunk = await asyncio.wait_for(
+                    self.process.stdout.read(65536), timeout=timeout_sec
+                )
+                if not chunk:
+                    self.process = None
+                    return "", time.time() - start_time, "Connection lost"
+
+                buffer.extend(chunk)
+                # O(1) search at the tail end of the buffer
+                search_start = max(0, len(buffer) - len(chunk) - len(magic_bytes))
+                if buffer.find(magic_bytes, search_start) != -1:
+                    break
+
+            # Find the magic string and extract the exit code
+            idx = buffer.find(magic_bytes)
+            # Find the newline after the magic string
+            nl_idx = buffer.find(b"\n", idx)
+            if nl_idx == -1:
+                # Read one more line if newline isn't in buffer
+                code_line = await asyncio.wait_for(
+                    self.process.stdout.readline(), timeout=5.0
+                )
+                exit_code_str = code_line.decode("utf-8", errors="ignore").strip()
+            else:
+                exit_code_str = (
+                    buffer[idx + len(magic_bytes) : nl_idx]
+                    .decode("utf-8", errors="ignore")
+                    .strip()
+                )
+
+            output = buffer[:idx].decode("utf-8", errors="ignore").strip()
+
+            try:
+                exit_code = int(exit_code_str)
+                if exit_code != 0 and exit_code not in (124, 2) and not output:
+                    return "", time.time() - start_time, f"Exited with {exit_code}"
+            except ValueError:
+                pass
+
+            return output, time.time() - start_time, None
+
         except asyncio.TimeoutError:
             try:
-                process.kill()
+                self.process.kill()
+            except Exception:
+                pass
+            self.process = None
+            return "", time.time() - start_time, "Timed out"
+        except Exception as e:
+            self.process = None
+            return "", time.time() - start_time, str(e)
+
+    def close(self):
+        if self.process and self.process.returncode is None:
+            try:
+                self.process.stdin.write(b"exit\n")
+                self.process.stdin.close()
             except:
                 pass
-            return server, "", time.time() - start_time, "Timed out"
-        except Exception as e:
-            return server, "", time.time() - start_time, str(e)
+            try:
+                self.process.kill()
+            except:
+                pass
+
+
+async def fetch_metrics(worker, timeout_sec, params_str):
+    cmd = f"sudo lctl get_param {params_str} 2>/dev/null"
+    stdout, elapsed, error = await worker.run_cmd(cmd, timeout_sec + 2)
+    return worker.server, stdout, elapsed, error
 
 
 def process_metrics(server, metrics_text, history, current_stats, is_first):
@@ -296,6 +372,105 @@ def process_metrics(server, metrics_text, history, current_stats, is_first):
                     current_stats[current_client]["ops"][op] += diff
 
 
+async def worker_loop(servers, params_str, pipe, ssh_cmd):
+    history = {}
+    is_first = True
+    workers = {srv: SSHWorker(srv, ssh_cmd) for srv in servers}
+
+    async def connect_worker(w):
+        await w.connect()
+
+    await asyncio.gather(
+        *[connect_worker(w) for w in workers.values()], return_exceptions=True
+    )
+
+    loop = asyncio.get_event_loop()
+    pipe.send(("ready",))
+
+    async def get_pipe_msg():
+        fut = loop.create_future()
+        fd = pipe.fileno()
+
+        def reader():
+            if pipe.poll():
+                if not fut.done():
+                    try:
+                        fut.set_result(pipe.recv())
+                    except EOFError:
+                        fut.set_exception(EOFError())
+                    except Exception as e:
+                        fut.set_exception(e)
+
+        loop.add_reader(fd, reader)
+        try:
+            return await fut
+        finally:
+            loop.remove_reader(fd)
+
+    while True:
+        try:
+            cmd = await get_pipe_msg()
+        except EOFError:
+            break
+
+        if cmd[0] == "quit":
+            break
+        elif cmd[0] == "fetch":
+            timeout_sec = cmd[1]
+            current_stats = defaultdict(
+                lambda: {
+                    "wr_bytes": 0,
+                    "rd_bytes": 0,
+                    "ops": defaultdict(int),
+                    "locks": defaultdict(int),
+                }
+            )
+
+            tasks = [
+                fetch_metrics(workers[srv], timeout_sec, params_str) for srv in servers
+            ]
+            start_time = time.time()
+            results = await asyncio.gather(*tasks)
+            max_fetch_time = time.time() - start_time
+
+            errors = []
+            for server, metrics_text, elapsed, error in results:
+                if error:
+                    errors.append((server, error))
+                else:
+                    process_metrics(
+                        server, metrics_text, history, current_stats, is_first
+                    )
+
+            is_first = False
+            pipe.send(
+                ("result", default_to_regular(current_stats), errors, max_fetch_time)
+            )
+
+    for w in workers.values():
+        w.close()
+
+
+def worker_process(servers, params_str, pipe, ssh_cmd):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(worker_loop(servers, params_str, pipe, ssh_cmd))
+    except Exception:
+        pass
+    finally:
+        try:
+            if hasattr(signal, "set_wakeup_fd"):
+                try:
+                    signal.set_wakeup_fd(-1)
+                except ValueError:
+                    pass
+            loop.close()
+        except:
+            pass
+
+
 OP_MAP = {
     "read": "r",
     "write": "w",
@@ -321,15 +496,47 @@ OP_MAP = {
 
 
 async def main_loop(
-    servers, interval, threshold, limit, print_header, sort_by, params_str
+    workers, interval, threshold, limit, print_header, sort_by, total_servers
 ):
-    history = {}
-    is_first = True
-    sem = asyncio.Semaphore(FANOUT)
     current_sort = sort_by
+    is_first = True
+    loop = asyncio.get_event_loop()
+
+    async def get_msg(w):
+        fut = loop.create_future()
+        p = w["pipe"]
+        fd = p.fileno()
+
+        def reader():
+            if p.poll():
+                if not fut.done():
+                    try:
+                        fut.set_result(p.recv())
+                    except EOFError:
+                        fut.set_exception(EOFError())
+                    except Exception as e:
+                        fut.set_exception(e)
+
+        loop.add_reader(fd, reader)
+        try:
+            return await fut
+        finally:
+            loop.remove_reader(fd)
+
+    print(
+        f"Initializing persistent SSH connections to {total_servers} servers across {len(workers)} worker processes..."
+    )
+    await asyncio.gather(*[get_msg(w) for w in workers])
+    clear_screen()
 
     while True:
-        current_stats = defaultdict(
+        curl_timeout = max(5, interval - 2)
+        for w in workers:
+            w["pipe"].send(("fetch", curl_timeout))
+
+        results = await asyncio.gather(*[get_msg(w) for w in workers])
+
+        all_stats = defaultdict(
             lambda: {
                 "wr_bytes": 0,
                 "rd_bytes": 0,
@@ -337,36 +544,38 @@ async def main_loop(
                 "locks": defaultdict(int),
             }
         )
+        all_errors = []
+        global_max_fetch_time = 0.0
 
-        curl_timeout = max(5, interval - 2)
-        tasks = [fetch_metrics(srv, curl_timeout, sem, params_str) for srv in servers]
-        results = await asyncio.gather(*tasks)
-
-        max_fetch_time = 0
-        errors = []
-        for server, metrics_text, elapsed, error in results:
-            max_fetch_time = max(max_fetch_time, elapsed)
-            if error:
-                errors.append((server, error))
-            else:
-                process_metrics(server, metrics_text, history, current_stats, is_first)
-
-        if errors:
-            for srv, err in errors:
-                print(f"Error fetching metrics from {srv}: {err}", file=sys.stderr)
-            sys.exit(1)
+        for msg, stats, errors, max_fetch_time in results:
+            global_max_fetch_time = max(global_max_fetch_time, max_fetch_time)
+            all_errors.extend(errors)
+            for client, c_stats in stats.items():
+                all_stats[client]["wr_bytes"] += c_stats["wr_bytes"]
+                all_stats[client]["rd_bytes"] += c_stats["rd_bytes"]
+                for op, count in c_stats["ops"].items():
+                    all_stats[client]["ops"][op] += count
+                for lock, count in c_stats["locks"].items():
+                    all_stats[client]["locks"][lock] += count
 
         if not is_first:
             clear_screen()
 
             if print_header:
                 warning = ""
-                if max_fetch_time > interval:
+                if global_max_fetch_time > interval:
                     warning = " " + c_red("[WARNING: Fetch time exceeds interval!]")
 
                 print(
-                    f"{c_bgrey(f'Servers: {len(servers)} | Max Fetch Time: {max_fetch_time:.2f}s | Interval: {interval}s | Sort: {current_sort}')}{warning}"
+                    f"{c_bgrey(f'Servers: {total_servers} | Max Fetch Time: {global_max_fetch_time:.2f}s | Interval: {interval}s | Sort: {current_sort}')}{warning}"
                 )
+
+                if all_errors:
+                    err_msg = ", ".join(f"{srv}: {err}" for srv, err in all_errors[:3])
+                    if len(all_errors) > 3:
+                        err_msg += f" ... (+{len(all_errors)-3} more)"
+                    print(c_red(f"Errors ({len(all_errors)}): {err_msg}"))
+
                 print(
                     c_bcyan(
                         f"{'CLIENT_IP':<18} {'WRITE(MBps)':<12} {'READ(MBps)':<12} {'LOCK(ops)':<22} REQ(ops)"
@@ -374,7 +583,7 @@ async def main_loop(
                 )
 
             sorted_stats = []
-            for ip, stats in current_stats.items():
+            for ip, stats in all_stats.items():
                 interval_for_calc = interval if interval > 0 else 1
                 wr_mbps = (stats["wr_bytes"] / 1048576.0) / interval_for_calc
                 rd_mbps = (stats["rd_bytes"] / 1048576.0) / interval_for_calc
@@ -543,7 +752,7 @@ async def main_loop(
 
 
 def main():
-    global SSH_CMD, FANOUT
+    global SSH_CMD
 
     epilog = """
 Output Abbreviations:
@@ -571,11 +780,11 @@ Output Abbreviations:
         help="report load over NUMBER seconds (default: 10)",
     )
     parser.add_argument(
-        "-f",
-        "--fanout",
+        "-w",
+        "--workers",
         type=int,
-        default=32,
-        help="limit concurrent SSH processes (default: 32)",
+        default=min(os.cpu_count() or 4, 16),
+        help="number of worker processes (default: up to 16 based on CPUs)",
     )
     parser.add_argument(
         "-t",
@@ -607,14 +816,13 @@ Output Abbreviations:
     )
     parser.add_argument(
         "--remote-shell",
-        default="/usr/bin/ssh",
-        help="use remote shell at PATH to execute SSH",
+        default=SSH_CMD,
+        help=f"specify remote shell (default: {SSH_CMD})",
     )
 
     args = parser.parse_args()
 
-    SSH_CMD = f"{args.remote_shell} -C -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5"
-    FANOUT = args.fanout
+    SSH_CMD = f"{args.remote_shell}"
 
     params = []
     query_all = not args.ost and not args.mdt
@@ -643,6 +851,22 @@ Output Abbreviations:
         print(f"No servers found for targets: {args.targets}", file=sys.stderr)
         sys.exit(1)
 
+    num_workers = min(args.workers, len(servers))
+    chunk_size = (len(servers) + num_workers - 1) // num_workers
+    workers = []
+
+    for i in range(num_workers):
+        chunk = servers[i * chunk_size : (i + 1) * chunk_size]
+        if not chunk:
+            continue
+        parent_conn, child_conn = mp.Pipe()
+        p = mp.Process(
+            target=worker_process,
+            args=(chunk, params_str, child_conn, SSH_CMD),
+        )
+        p.start()
+        workers.append({"process": p, "pipe": parent_conn, "servers": chunk})
+
     try:
         loop = asyncio.get_event_loop()
         print(
@@ -651,29 +875,60 @@ Output Abbreviations:
         )
         main_task = asyncio.ensure_future(
             main_loop(
-                servers,
+                workers,
                 args.interval,
                 args.threshold,
                 args.limit,
                 not args.no_header,
                 args.sort_by,
-                params_str,
+                len(servers),
             )
         )
         loop.run_until_complete(main_task)
     except KeyboardInterrupt:
-        main_task.cancel()
-        pending = asyncio.Task.all_tasks(loop=loop)
-        for task in pending:
-            task.cancel()
-        try:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        except asyncio.CancelledError:
-            pass
+        pass
     finally:
+        # Ignore signals during cleanup
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGCHLD):
+            try:
+                signal.signal(sig, signal.SIG_IGN)
+            except:
+                pass
+
+        # Cancel all tasks
         try:
-            if not loop.is_running():
-                loop.close()
+            try:
+                pending = asyncio.all_tasks(loop=loop)
+            except AttributeError:
+                pending = asyncio.Task.all_tasks(loop=loop)
+
+            if pending:
+                for task in pending:
+                    task.cancel()
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+        except Exception:
+            pass
+
+        for w in workers:
+            try:
+                w["pipe"].send(("quit",))
+            except:
+                pass
+        for w in workers:
+            w["process"].join(timeout=1)
+            if w["process"].is_alive():
+                w["process"].terminate()
+
+        try:
+            # Crucial: Reset wakeup fd before closing loop to avoid OSError: [Errno 9] Bad file descriptor
+            if hasattr(signal, "set_wakeup_fd"):
+                try:
+                    signal.set_wakeup_fd(-1)
+                except ValueError:
+                    pass
+            loop.close()
         except:
             pass
         sys.exit(0)
