@@ -31,13 +31,15 @@ $ ./lltop oss[1-5] mds1
 
 ```text
 Usage: lltop [-h] [-i INTERVAL] [-f FANOUT] [-t THRESHOLD] [-n LIMIT]
-             [-s SORT_BY] [--no-header] [--remote-shell REMOTE_SHELL]
+             [-s {req,read,write,rw,lock}] [--ost] [--mdt] [--no-header]
+             [--remote-shell REMOTE_SHELL]
              [targets [targets ...]]
 
 Report load by client IP for a Lustre mountpoint or SERVER(s).
 
 positional arguments:
-  targets               Local Lustre mountpoint (starts with '/') OR list of servers
+  targets               Local Lustre mountpoint (starts with '/') OR list of
+                        servers
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -46,21 +48,28 @@ optional arguments:
   -f FANOUT, --fanout FANOUT
                         limit concurrent SSH processes (default: 32)
   -t THRESHOLD, --threshold THRESHOLD
-                        hide operations with count less than NUMBER (default: 10)
+                        hide operations with count less than NUMBER (default:
+                        10)
   -n LIMIT, --limit LIMIT
                         limit output to NUMBER clients (default: 10)
-  -s SORT_BY, --sort-by SORT_BY
-                        sort by: req (default), bw, or op short name (e.g., cr, op)
+  -s {req,read,write,rw,lock}, --sort-by {req,read,write,rw,lock}
+                        sort by: req (default), read, write, rw, or lock
+  --ost                 query OST components (obdfilter)
+  --mdt                 query MDT components (mdt)
   --no-header           do not display header
   --remote-shell REMOTE_SHELL
-                        use shell to execute remote command
+                        use shell to execute remote command (default:
+                        /usr/bin/ssh -o BatchMode=yes -o
+                        StrictHostKeyChecking=no -o ConnectTimeout=5)
 
-Operation & Lock Mappings (--sort-by support):
- blc: ldlm_bl_callback  cl: close         cr: create       cxl: ldlm_cancel
-  dy: destroy      enq: ldlm_enqueue  ga: getattr       gi: get_info
-  mk: mknod         op: open          pa: prealloc      pu: punch
-   r: read          sa: setattr       st: statfs        sy: sync
-  un: unlink         w: write
+Output Abbreviations:
+  blc : ldlm_bl_callback  cl  : close             cpc : ldlm_cp_callback
+  cr  : create            cxl : ldlm_cancel       dy  : destroy
+  enq : ldlm_enqueue      ga  : getattr           gi  : get_info
+  glc : ldlm_gl_callback  mk  : mknod             op  : open
+  pa  : prealloc          pu  : punch             r   : read
+  sa  : setattr           st  : statfs            sy  : sync
+  un  : unlink            w   : write
 ```
 
 ## Output Columns

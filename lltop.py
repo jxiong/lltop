@@ -7,35 +7,74 @@ import sys
 import os
 import re
 import time
+import select
+import termios
+import tty
 from collections import defaultdict
 
-# Metrics to fetch from MDS and OSS nodes
-LUSTRE_LCTL_PARAMS = [
-    "mdt.*.exports.*.stats",
-    "obdfilter.*.exports.*.stats",
-    "mdt.*.exports.*.ldlm_stats",
-    "obdfilter.*.exports.*.ldlm_stats"
-]
 
-SSH_CMD = "/usr/bin/ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5"
+def c_red(text):
+    return f"\033[1;31m{text}\033[0m"
+
+
+def c_green(text):
+    return f"\033[92m{text}\033[0m"
+
+
+def c_yellow(text):
+    return f"\033[93m{text}\033[0m"
+
+
+def c_cyan(text):
+    return f"\033[36m{text}\033[0m"
+
+
+def c_bcyan(text):
+    return f"\033[1;36m{text}\033[0m"
+
+
+def c_white(text):
+    return f"\033[37m{text}\033[0m"
+
+
+def c_bwhite(text):
+    return f"\033[1;37m{text}\033[0m"
+
+
+def c_grey(text):
+    return f"\033[90m{text}\033[0m"
+
+
+def c_bgrey(text):
+    return f"\033[1;30m{text}\033[0m"
+
+
+def clear_screen():
+    print("\033[H\033[J", end="")
+
+
+SSH_CMD = (
+    "/usr/bin/ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5"
+)
 FANOUT = 32
 
+
 def expand_node(node_str):
-    match = re.search(r'\[(.*?)\]', node_str)
+    match = re.search(r"\[(.*?)\]", node_str)
     if not match:
         return [node_str]
 
-    prefix = node_str[:match.start()]
-    suffix = node_str[match.end():]
+    prefix = node_str[: match.start()]
+    suffix = node_str[match.end() :]
     inner = match.group(1)
 
     expanded_nodes = []
-    for part in inner.split(','):
+    for part in inner.split(","):
         part = part.strip()
-        if '-' in part:
+        if "-" in part:
             try:
-                start_str, end_str = part.split('-', 1)
-                pad_len = len(start_str) if start_str.startswith('0') else 0
+                start_str, end_str = part.split("-", 1)
+                pad_len = len(start_str) if start_str.startswith("0") else 0
                 start, end = int(start_str), int(end_str)
                 for i in range(start, end + 1):
                     mid = f"{i:0{pad_len}d}" if pad_len else str(i)
@@ -50,6 +89,7 @@ def expand_node(node_str):
         result.extend(expand_node(node))
     return result
 
+
 def expand_hostlist(hosts):
     result = []
     for host in hosts:
@@ -63,25 +103,35 @@ def expand_hostlist(hosts):
             seen.add(r)
     return unique_result
 
+
 def get_servers_from_mountpoint(mountpoint):
     try:
         cmd = f"lfs getname {mountpoint} 2>/dev/null"
-        output = subprocess.check_output(cmd, shell=True).decode('utf-8', errors='ignore').strip()
+        output = (
+            subprocess.check_output(cmd, shell=True)
+            .decode("utf-8", errors="ignore")
+            .strip()
+        )
         if not output:
             return []
 
-        fsname = output.split('-')[0].split(' ')[0].strip()
+        fsname = output.split("-")[0].split(" ")[0].strip()
         servers = set()
 
-        for comp in ['osc', 'mdc']:
+        for comp in ["osc", "mdc"]:
             cmd = f"lctl get_param -n {comp}.{fsname}-*.conn_uuid 2>/dev/null"
             try:
-                uuids = subprocess.check_output(cmd, shell=True).decode('utf-8', errors='ignore').splitlines()
+                uuids = (
+                    subprocess.check_output(cmd, shell=True)
+                    .decode("utf-8", errors="ignore")
+                    .splitlines()
+                )
                 for uuid in uuids:
                     uuid = uuid.strip()
-                    if not uuid: continue
-                    if '@' in uuid:
-                        ip = uuid.split('@')[0]
+                    if not uuid:
+                        continue
+                    if "@" in uuid:
+                        ip = uuid.split("@")[0]
                         servers.add(ip)
             except subprocess.CalledProcessError:
                 pass
@@ -90,19 +140,23 @@ def get_servers_from_mountpoint(mountpoint):
         if not server_list:
             return []
 
-        print(f"Deduplicating {len(server_list)} potential server NIDs...", file=sys.stderr)
-        
         async def do_dedup():
             sem = asyncio.Semaphore(FANOUT)
+
             async def get_hostname(server):
                 async with sem:
                     cmd = f"{SSH_CMD} {server} 'uname -n'"
                     try:
                         process = await asyncio.create_subprocess_shell(
-                            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+                            cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        stdout, stderr = await asyncio.wait_for(
+                            process.communicate(), timeout=10
+                        )
                         if process.returncode == 0:
-                            hn = stdout.decode('utf-8', errors='ignore').strip()
+                            hn = stdout.decode("utf-8", errors="ignore").strip()
                             if hn:
                                 return server, hn
                     except Exception:
@@ -119,33 +173,34 @@ def get_servers_from_mountpoint(mountpoint):
 
             return sorted(list(hostname_to_ip.values()))
 
-        # If an event loop is already running, this needs to be scheduled differently,
-        # but since this runs before main_loop, we can safely create/use a new one or the current one.
         loop = asyncio.get_event_loop()
         deduped = loop.run_until_complete(do_dedup())
-        
-        print(f"Found {len(deduped)} unique server nodes.", file=sys.stderr)
         return deduped
     except Exception as e:
         print(f"Error discovering servers: {e}", file=sys.stderr)
         return []
 
-async def fetch_metrics(server, timeout_sec, sem):
+
+async def fetch_metrics(server, timeout_sec, sem, params_str):
     async with sem:
-        params_str = " ".join(LUSTRE_LCTL_PARAMS)
         cmd = f"{SSH_CMD} {server} 'sudo lctl get_param {params_str} 2>/dev/null'"
         start_time = time.time()
         try:
             process = await asyncio.create_subprocess_shell(
-                cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            # Give a little extra buffer over the timeout
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_sec + 2)
+                cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=timeout_sec + 2
+            )
             elapsed = time.time() - start_time
-            if process.returncode != 0 and process.returncode != 124:
+            if process.returncode != 0 and process.returncode not in (124, 2):
                 if not stdout:
-                    err_msg = stderr.decode('utf-8', errors='ignore').strip() or f"Exited with {process.returncode}"
+                    err_msg = (
+                        stderr.decode("utf-8", errors="ignore").strip()
+                        or f"Exited with {process.returncode}"
+                    )
                     return server, "", elapsed, err_msg
-            return server, stdout.decode('utf-8', errors='ignore'), elapsed, None
+            return server, stdout.decode("utf-8", errors="ignore"), elapsed, None
         except asyncio.TimeoutError:
             try:
                 process.kill()
@@ -162,17 +217,22 @@ def process_metrics(server, metrics_text, history, current_stats, is_first):
 
     for line in metrics_text.splitlines():
         line = line.strip()
-        if not line: continue
+        if not line:
+            continue
 
         if line.endswith(".stats=") or line.endswith(".ldlm_stats="):
             if ".exports." in line:
                 try:
-                    target_part, client_part = line.split('.exports.', 1)
-                    current_target = target_part.split('.', 1)[1]
+                    target_part, client_part = line.split(".exports.", 1)
+                    current_target = target_part.split(".", 1)[1]
                     if client_part.endswith(".stats="):
-                        current_client = client_part.rsplit('.stats=', 1)[0].split('@')[0]
+                        current_client = client_part.rsplit(".stats=", 1)[0].split("@")[
+                            0
+                        ]
                     else:
-                        current_client = client_part.rsplit('.ldlm_stats=', 1)[0].split('@')[0]
+                        current_client = client_part.rsplit(".ldlm_stats=", 1)[0].split(
+                            "@"
+                        )[0]
                 except Exception:
                     current_client = None
             continue
@@ -210,7 +270,8 @@ def process_metrics(server, metrics_text, history, current_stats, is_first):
         prev_val = history.get(key, 0)
 
         diff = val - prev_val
-        if diff < 0: diff = 0
+        if diff < 0:
+            diff = 0
         history[key] = val
 
         if is_first:
@@ -219,50 +280,66 @@ def process_metrics(server, metrics_text, history, current_stats, is_first):
         if diff > 0:
             if metric_type == "bytes":
                 if op == "write_bytes":
-                    current_stats[current_client]['wr_bytes'] += diff
+                    current_stats[current_client]["wr_bytes"] += diff
                 elif op == "read_bytes":
-                    current_stats[current_client]['rd_bytes'] += diff
+                    current_stats[current_client]["rd_bytes"] += diff
             elif metric_type == "stats":
-                if op in ("ldlm_enqueue", "ldlm_cancel", "ldlm_bl_callback", "ldlm_cp_callback"):
-                    current_stats[current_client]['locks'][op] += diff
+                if op in (
+                    "ldlm_enqueue",
+                    "ldlm_cancel",
+                    "ldlm_bl_callback",
+                    "ldlm_cp_callback",
+                    "ldlm_gl_callback",
+                ):
+                    current_stats[current_client]["locks"][op] += diff
                 else:
-                    current_stats[current_client]['ops'][op] += diff
+                    current_stats[current_client]["ops"][op] += diff
+
 
 OP_MAP = {
-    'read': 'r',
-    'write': 'w',
-    'close': 'cl',
-    'open': 'op',
-    'create': 'cr',
-    'statfs': 'st',
-    'get_info': 'gi',
-    'prealloc': 'pa',
-    'punch': 'pu',
-    'sync': 'sy',
-    'getattr': 'ga',
-    'setattr': 'sa',
-    'unlink': 'un',
-    'mknod': 'mk',
-    'destroy': 'dy',
-    'ldlm_enqueue': 'enq',
-    'ldlm_cancel': 'cxl',
-    'ldlm_bl_callback': 'blc'
+    "read": "r",
+    "write": "w",
+    "close": "cl",
+    "open": "op",
+    "create": "cr",
+    "statfs": "st",
+    "get_info": "gi",
+    "prealloc": "pa",
+    "punch": "pu",
+    "sync": "sy",
+    "getattr": "ga",
+    "setattr": "sa",
+    "unlink": "un",
+    "mknod": "mk",
+    "destroy": "dy",
+    "ldlm_enqueue": "enq",
+    "ldlm_cancel": "cxl",
+    "ldlm_bl_callback": "blc",
+    "ldlm_cp_callback": "cpc",
+    "ldlm_gl_callback": "glc",
 }
 
-REV_OP_MAP = {v: k for k, v in OP_MAP.items()}
 
-
-async def main_loop(servers, interval, threshold, limit, print_header, sort_by):
+async def main_loop(
+    servers, interval, threshold, limit, print_header, sort_by, params_str
+):
     history = {}
     is_first = True
     sem = asyncio.Semaphore(FANOUT)
+    current_sort = sort_by
 
     while True:
-        current_stats = defaultdict(lambda: {'wr_bytes': 0, 'rd_bytes': 0, 'ops': defaultdict(int), 'locks': defaultdict(int)})
+        current_stats = defaultdict(
+            lambda: {
+                "wr_bytes": 0,
+                "rd_bytes": 0,
+                "ops": defaultdict(int),
+                "locks": defaultdict(int),
+            }
+        )
 
-        # Determine a reasonable curl timeout based on the interval
         curl_timeout = max(5, interval - 2)
-        tasks = [fetch_metrics(srv, curl_timeout, sem) for srv in servers]
+        tasks = [fetch_metrics(srv, curl_timeout, sem, params_str) for srv in servers]
         results = await asyncio.gather(*tasks)
 
         max_fetch_time = 0
@@ -280,112 +357,274 @@ async def main_loop(servers, interval, threshold, limit, print_header, sort_by):
             sys.exit(1)
 
         if not is_first:
-            # Clear screen
-            print("\033[H\033[J", end='')
+            clear_screen()
 
             if print_header:
                 warning = ""
                 if max_fetch_time > interval:
-                    warning = f" \033[1;31m[WARNING: Fetch time exceeds interval!]\033[0m"
+                    warning = " " + c_red("[WARNING: Fetch time exceeds interval!]")
 
-                print(f"\033[1;30mServers: {len(servers)} | Max Fetch Time: {max_fetch_time:.2f}s | Interval: {interval}s\033[0m{warning}")
-                # Bold Cyan header
-                print(f"\033[1;36m{'CLIENT_IP':<18} {'WRITE(MBps)':<12} {'READ(MBps)':<12} {'LOCK(ops)':<22} REQ(ops)\033[0m")
+                print(
+                    f"{c_bgrey(f'Servers: {len(servers)} | Max Fetch Time: {max_fetch_time:.2f}s | Interval: {interval}s | Sort: {current_sort}')}{warning}"
+                )
+                print(
+                    c_bcyan(
+                        f"{'CLIENT_IP':<18} {'WRITE(MBps)':<12} {'READ(MBps)':<12} {'LOCK(ops)':<22} REQ(ops)"
+                    )
+                )
 
             sorted_stats = []
             for ip, stats in current_stats.items():
-                wr_mbps = (stats['wr_bytes'] / 1048576.0) / interval
-                rd_mbps = (stats['rd_bytes'] / 1048576.0) / interval
+                interval_for_calc = interval if interval > 0 else 1
+                wr_mbps = (stats["wr_bytes"] / 1048576.0) / interval_for_calc
+                rd_mbps = (stats["rd_bytes"] / 1048576.0) / interval_for_calc
 
-                filtered_ops = {k: v for k, v in stats['ops'].items() if v >= threshold}
+                filtered_ops = {k: v for k, v in stats["ops"].items() if v >= threshold}
                 total_reqs = sum(filtered_ops.values())
 
-                filtered_locks = {k: v for k, v in stats['locks'].items() if v >= threshold}
+                filtered_locks = {
+                    k: v for k, v in stats["locks"].items() if v >= threshold
+                }
                 total_locks = sum(filtered_locks.values())
 
-                if stats['wr_bytes'] == 0 and stats['rd_bytes'] == 0 and not filtered_ops and not filtered_locks:
+                if (
+                    stats["wr_bytes"] == 0
+                    and stats["rd_bytes"] == 0
+                    and not filtered_ops
+                    and not filtered_locks
+                ):
                     continue
 
-                top_ops = sorted(filtered_ops.items(), key=lambda x: x[1], reverse=True)[:3]
+                top_ops = sorted(
+                    filtered_ops.items(), key=lambda x: x[1], reverse=True
+                )[:3]
                 if top_ops:
-                    # Cyan operation names, White operation counts
-                    top_ops_details = ",".join([f"\033[36m{OP_MAP.get(op, op)}\033[0m:\033[37m{int(round(count/interval))}\033[0m" for op, count in top_ops])
-                    # Bold White for total operations
-                    top_ops_str = f"\033[1;37m{int(round(total_reqs/interval))}\033[0m ({top_ops_details})"
+                    top_ops_details = ",".join(
+                        [
+                            f"{c_cyan(OP_MAP.get(op, op))}:{c_white(int(round(count/interval_for_calc)))}"
+                            for op, count in top_ops
+                        ]
+                    )
+                    top_ops_str = f"{c_bwhite(int(round(total_reqs/interval_for_calc)))} ({top_ops_details})"
                 else:
-                    top_ops_str = "\033[90m-\033[0m" # Dark grey for empty
+                    top_ops_str = c_grey("0")
 
                 if total_locks > 0:
-                    max_op_orig, max_val = max(filtered_locks.items(), key=lambda x: x[1])
-                    max_op = OP_MAP.get(max_op_orig, max_op_orig.replace('ldlm_', ''))
-                    max_val_ps = int(round(max_val / interval))
-                    top_locks_str = f"\033[1;37m{int(round(total_locks/interval))}\033[0m (\033[36m{max_op}\033[0m:\033[37m{max_val_ps}\033[0m)"
-                    # Visual width is roughly len(str(total)) + 2 + len(max_op) + 1 + len(str(max_val_ps)) + 1
-                    # ANSI overhead is 29 characters. To get 22 visual chars, we pad to 51.
+                    max_op_orig, max_val = max(
+                        filtered_locks.items(), key=lambda x: x[1]
+                    )
+                    max_op = OP_MAP.get(max_op_orig, max_op_orig.replace("ldlm_", ""))
+                    max_val_ps = int(round(max_val / interval_for_calc))
+                    top_locks_str = f"{c_bwhite(int(round(total_locks/interval_for_calc)))} ({c_cyan(max_op)}:{c_white(max_val_ps)})"
                     top_locks_padded = f"{top_locks_str:<51}"
                 else:
-                    top_locks_str = "\033[90m0\033[0m"
-                    # ANSI overhead is 9. To get 22 visual chars, pad to 31.
+                    top_locks_str = c_grey("0")
                     top_locks_padded = f"{top_locks_str:<31}"
 
-                sorted_stats.append((ip, wr_mbps, rd_mbps, top_locks_padded, total_locks, top_ops_str, total_reqs, stats))
+                sorted_stats.append(
+                    (
+                        ip,
+                        wr_mbps,
+                        rd_mbps,
+                        top_locks_padded,
+                        total_locks,
+                        top_ops_str,
+                        total_reqs,
+                    )
+                )
 
-            # Apply sorting based on the requested sort_by parameter
-            if sort_by == 'bw':
+            if current_sort == "write":
+                sorted_stats.sort(key=lambda x: (x[1], x[6]), reverse=True)
+            elif current_sort == "read":
+                sorted_stats.sort(key=lambda x: (x[2], x[6]), reverse=True)
+            elif current_sort == "rw":
                 sorted_stats.sort(key=lambda x: (x[1] + x[2], x[6]), reverse=True)
-            elif sort_by in REV_OP_MAP:
-                long_op = REV_OP_MAP[sort_by]
-                sorted_stats.sort(key=lambda x: (x[7]['ops'].get(long_op, 0) + x[7]['locks'].get(long_op, 0), x[6]), reverse=True)
-            else: # Default: sort by total_reqs desc, total_locks desc, wr_mbps desc, rd_mbps desc
+            elif current_sort == "lock":
+                sorted_stats.sort(key=lambda x: (x[4], x[6]), reverse=True)
+            else:  # Default: 'req'
                 sorted_stats.sort(key=lambda x: (x[6], x[4], x[1], x[2]), reverse=True)
 
             print_count = 0
             for stat in sorted_stats:
                 if limit and print_count >= limit:
                     break
-                ip, wr_mbps, rd_mbps, top_locks_padded, total_locks, top_ops_str, total_reqs, _ = stat
-                # Green IP, Yellow bandwidth numbers
-                print(f"\033[92m{ip:<18}\033[0m \033[93m{wr_mbps:<12.1f}\033[0m \033[93m{rd_mbps:<12.1f}\033[0m {top_locks_padded} {top_ops_str}")
+                (
+                    ip,
+                    wr_mbps,
+                    rd_mbps,
+                    top_locks_padded,
+                    total_locks,
+                    top_ops_str,
+                    total_reqs,
+                ) = stat
+                print(
+                    f"{c_green(f'{ip:<18}')} {c_yellow(f'{wr_mbps:<12.1f}')} {c_yellow(f'{rd_mbps:<12.1f}')} {top_locks_padded} {top_ops_str}"
+                )
                 print_count += 1
 
             sys.stdout.flush()
-            await asyncio.sleep(interval)
+
+            waited = 0.0
+            prompt_mode = False
+
+            def check_stdin():
+                nonlocal current_sort, prompt_mode, waited
+                try:
+                    c = sys.stdin.read(1)
+                    if not c:
+                        return
+                    if prompt_mode:
+                        prompt_mode = False
+                        if c == "1":
+                            current_sort = "write"
+                        elif c == "2":
+                            current_sort = "read"
+                        elif c == "3":
+                            current_sort = "rw"
+                        elif c == "4":
+                            current_sort = "lock"
+                        elif c == "5":
+                            current_sort = "req"
+
+                        if c in "12345":
+                            print(c, flush=True)
+                            waited = interval  # Force refresh
+                        elif c in ("\n", "\r"):
+                            print("", flush=True)
+                        else:
+                            print(f"{c}\n{c_red(f'Invalid option {c!r}.')}", flush=True)
+                            waited = interval
+                    else:
+                        if c == "s":
+                            prompt_mode = True
+                            print(
+                                "\nSort by: [1]write [2]read [3]rw [4]lock [5]req ? ",
+                                end="",
+                                flush=True,
+                            )
+                        elif c == "q":
+                            raise KeyboardInterrupt
+                except Exception as e:
+                    if isinstance(e, KeyboardInterrupt):
+                        raise
+
+            fd = sys.stdin.fileno()
+            try:
+                is_tty = os.isatty(fd)
+            except Exception:
+                is_tty = False
+
+            if is_tty:
+                try:
+                    old_settings = termios.tcgetattr(fd)
+                    tty.setcbreak(fd)
+                    os.set_blocking(fd, False)
+                    loop = asyncio.get_event_loop()
+                    loop.add_reader(fd, check_stdin)
+                except Exception:
+                    is_tty = False
+
+            try:
+                while waited < interval or prompt_mode:
+                    await asyncio.sleep(0.1)
+                    if not prompt_mode:
+                        waited += 0.1
+            finally:
+                if is_tty:
+                    try:
+                        loop.remove_reader(fd)
+                        os.set_blocking(fd, True)
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    except Exception:
+                        pass
         else:
             is_first = False
+            await asyncio.sleep(interval)
+
 
 def main():
     global SSH_CMD, FANOUT
 
-    # Dynamically generate the mappings help text
-    map_str = ""
-    count = 0
-    for short_name, long_name in sorted(REV_OP_MAP.items(), key=lambda x: x[0]):
-        map_str += f"{short_name:<3}: {long_name:<18}"
-        count += 1
-        if count % 4 == 0:
-            map_str += "\n"
-    
-    epilog = f"""
-Operation & Lock Mappings (--sort-by support):
-{map_str}
+    epilog = """
+Output Abbreviations:
+  r:   read      w:   write     cl:  close      op:  open      cr:  create
+  st:  statfs    gi:  get_info  pa:  prealloc   pu:  punch     sy:  sync
+  ga:  getattr   sa:  setattr   un:  unlink     mk:  mknod     dy:  destroy
+  enq: enqueue   cxl: cancel    blc: bl_callback cpc: cp_callback
+  glc: gl_callback
 """
     parser = argparse.ArgumentParser(
         description="Report load by client IP for a Lustre mountpoint or SERVER(s).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=epilog)
-    parser.add_argument("targets", help="Local Lustre mountpoint (starts with '/') OR list of servers", nargs="*")
-    parser.add_argument("-i", "--interval", type=int, default=10, help="report load over NUMBER seconds (default: 10)")
-    parser.add_argument("-f", "--fanout", type=int, default=FANOUT, help=f"limit concurrent SSH processes (default: {FANOUT})")
-    parser.add_argument("-t", "--threshold", type=int, default=10, help="hide operations with count less than NUMBER (default: 10)")
-    parser.add_argument("-n", "--limit", type=int, default=10, help="limit output to NUMBER clients (default: 10)")
-    parser.add_argument("-s", "--sort-by", default="req", help="sort by: req (default), bw, or op short name (e.g., cr, op)")
-    parser.add_argument("--no-header", action="store_true", help="do not display header")
-    parser.add_argument("--remote-shell", default=SSH_CMD, help=f"use shell to execute remote command (default: {SSH_CMD})")
+        epilog=epilog,
+    )
+    parser.add_argument(
+        "targets",
+        help="Local Lustre mountpoint (starts with '/') OR list of servers",
+        nargs="*",
+    )
+    parser.add_argument(
+        "-i",
+        "--interval",
+        type=int,
+        default=10,
+        help="report load over NUMBER seconds (default: 10)",
+    )
+    parser.add_argument(
+        "-f",
+        "--fanout",
+        type=int,
+        default=32,
+        help="limit concurrent SSH processes (default: 32)",
+    )
+    parser.add_argument(
+        "-t",
+        "--threshold",
+        type=int,
+        default=10,
+        help="hide operations with count less than NUMBER (default: 10)",
+    )
+    parser.add_argument(
+        "-n",
+        "--limit",
+        type=int,
+        default=10,
+        help="limit output to NUMBER clients (default: 10)",
+    )
+    parser.add_argument(
+        "-s",
+        "--sort-by",
+        default="req",
+        choices=["req", "read", "write", "rw", "lock"],
+        help="sort by: req (default), read, write, rw, or lock",
+    )
+    parser.add_argument(
+        "--ost", action="store_true", help="query OST components (obdfilter)"
+    )
+    parser.add_argument("--mdt", action="store_true", help="query MDT components (mdt)")
+    parser.add_argument(
+        "--no-header", action="store_true", help="do not display header"
+    )
+    parser.add_argument(
+        "--remote-shell",
+        default="/usr/bin/ssh",
+        help="use remote shell at PATH to execute SSH",
+    )
 
     args = parser.parse_args()
 
-    SSH_CMD = args.remote_shell
+    SSH_CMD = f"{args.remote_shell} -C -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5"
     FANOUT = args.fanout
+
+    params = []
+    query_all = not args.ost and not args.mdt
+    if query_all or args.mdt:
+        params.extend(["mdt.*.exports.*.stats", "mdt.*.exports.*.ldlm_stats"])
+    if query_all or args.ost:
+        params.extend(
+            ["obdfilter.*.exports.*.stats", "obdfilter.*.exports.*.ldlm_stats"]
+        )
+    params_str = " ".join(params)
 
     if not args.targets:
         parser.print_help()
@@ -406,17 +645,27 @@ Operation & Lock Mappings (--sort-by support):
 
     try:
         loop = asyncio.get_event_loop()
+        print(
+            f"Collecting baseline metrics... (first refresh in {args.interval}s)",
+            file=sys.stderr,
+        )
         main_task = asyncio.ensure_future(
-            main_loop(servers, args.interval, args.threshold, args.limit, not args.no_header, args.sort_by)
+            main_loop(
+                servers,
+                args.interval,
+                args.threshold,
+                args.limit,
+                not args.no_header,
+                args.sort_by,
+                params_str,
+            )
         )
         loop.run_until_complete(main_task)
     except KeyboardInterrupt:
         main_task.cancel()
-        # Gather all pending tasks and cancel them
         pending = asyncio.Task.all_tasks(loop=loop)
         for task in pending:
             task.cancel()
-        # Run loop momentarily to let cancellations process and avoid warnings
         try:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         except asyncio.CancelledError:
@@ -429,5 +678,6 @@ Operation & Lock Mappings (--sort-by support):
             pass
         sys.exit(0)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
