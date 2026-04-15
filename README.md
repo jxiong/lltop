@@ -11,6 +11,7 @@ It queries the backend MDS and OSS servers using asynchronous SSH and pulls metr
 *   **Top-like Interface:** Automatically clears the terminal and refreshes metrics every N seconds, color-coding the output for readability.
 *   **Operation Filtering:** Filters out noisy, low-count operations (e.g., operations occurring < 10 times per interval) so you can focus on the primary workload types.
 *   **Highly Concurrent:** Uses Python's `asyncio` to execute all SSH and `curl` queries concurrently, preventing single slow nodes from blocking the update cycle.
+*   **Interactive Sorting:** Toggle sort order (write, read, rw, lock, or req) on the fly without restarting the tool.
 *   **Standalone Binary:** The project ships with a `Makefile` that uses PyInstaller to bundle `lltop.py` into a single, standalone Linux executable with no external Python dependencies.
 
 ## Usage
@@ -89,6 +90,18 @@ CLIENT_IP          WRITE(MBps)  READ(MBps)   LOCK(ops)              REQ(ops)
 *   **READ(MBps)**: Megabytes per second read by this client in the last interval.
 *   **LOCK(ops)**: A summary of Distributed Lock Management (DLM) operations per second. It uses the format: `total (max_op:rate)` displaying the highest rate operation (e.g. `enq` for enqueue, `cxl` for cancel, `blc` for bl_callback).
 *   **REQ(ops)**: A summary of the RPC operations per second performed by the client. It is formatted as `total_operations_per_sec (op1:rate, op2:rate, op3:rate)`. It displays up to the top 3 operations per second, sorted by frequency, that exceed the `--threshold` limit.
+
+### Interactive Commands
+
+While `lltop` is running, you can use the following keyboard shortcuts:
+
+*   **`s`**: Enter **Sort Mode**. After pressing `s`, you can press a number to change the sort order:
+    *   **`1`**: Sort by **WRITE** bandwidth.
+    *   **`2`**: Sort by **READ** bandwidth.
+    *   **`3`**: Sort by combined **RW** bandwidth.
+    *   **`4`**: Sort by **LOCK** operations.
+    *   **`5`**: Sort by total **REQ** (RPC) operations.
+*   **`q`**: Exit `lltop`.
 
 ## Installation / Building
 
