@@ -11,8 +11,26 @@ import select
 import termios
 import tty
 import signal
+import threading
 import multiprocessing as mp
 from collections import defaultdict
+
+
+# Global UI State
+ui_state = {
+    "all_stats": {},
+    "global_max_fetch_time": 0.0,
+    "all_errors": [],
+    "current_sort": "req",
+    "interval": 10,
+    "threshold": 10,
+    "limit": 10,
+    "print_header": True,
+    "total_servers": 0,
+    "lock": threading.Lock(),
+    "data_ready": threading.Event(),
+    "quit_flag": False,
+}
 
 
 def default_to_regular(d):
@@ -453,6 +471,7 @@ async def worker_loop(servers, params_str, pipe, ssh_cmd):
 
 def worker_process(servers, params_str, pipe, ssh_cmd):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    loop = None
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -460,15 +479,224 @@ def worker_process(servers, params_str, pipe, ssh_cmd):
     except Exception:
         pass
     finally:
-        try:
-            if hasattr(signal, "set_wakeup_fd"):
-                try:
-                    signal.set_wakeup_fd(-1)
-                except ValueError:
-                    pass
-            loop.close()
-        except:
-            pass
+        if loop:
+            try:
+                if hasattr(signal, "set_wakeup_fd"):
+                    try:
+                        signal.set_wakeup_fd(-1)
+                    except ValueError:
+                        pass
+                loop.close()
+            except:
+                pass
+
+
+def redraw_screen():
+    with ui_state["lock"]:
+        all_stats = ui_state["all_stats"]
+        global_max_fetch_time = ui_state["global_max_fetch_time"]
+        all_errors = ui_state["all_errors"]
+        current_sort = ui_state["current_sort"]
+        interval = ui_state["interval"]
+        threshold = ui_state["threshold"]
+        limit = ui_state["limit"]
+        print_header = ui_state["print_header"]
+        total_servers = ui_state["total_servers"]
+
+    if not all_stats:
+        return
+
+    clear_screen()
+
+    if print_header:
+        warning = ""
+        if global_max_fetch_time > interval:
+            warning = " " + c_red("[WARNING: Fetch time exceeds interval!]")
+
+        print(
+            f"{c_bgrey(f'Servers: {total_servers} | Max Fetch Time: {global_max_fetch_time:.2f}s | Interval: {interval}s | Sort: {current_sort}')}{warning}"
+        )
+
+        if all_errors:
+            err_msg = ", ".join(f"{srv}: {err}" for srv, err in all_errors[:3])
+            if len(all_errors) > 3:
+                err_msg += f" ... (+{len(all_errors)-3} more)"
+            print(c_red(f"Errors ({len(all_errors)}): {err_msg}"))
+
+        print(
+            c_bcyan(
+                f"{'CLIENT_IP':<18} {'WRITE(MBps)':<12} {'READ(MBps)':<12} {'LOCK(ops)':<22} REQ(ops)"
+            )
+        )
+
+    sorted_stats = []
+    for ip, stats in all_stats.items():
+        interval_for_calc = interval if interval > 0 else 1
+        wr_mbps = (stats["wr_bytes"] / 1048576.0) / interval_for_calc
+        rd_mbps = (stats["rd_bytes"] / 1048576.0) / interval_for_calc
+
+        filtered_ops = {k: v for k, v in stats["ops"].items() if v >= threshold}
+        total_reqs = sum(filtered_ops.values())
+
+        filtered_locks = {k: v for k, v in stats["locks"].items() if v >= threshold}
+        total_locks = sum(filtered_locks.values())
+
+        if (
+            stats["wr_bytes"] == 0
+            and stats["rd_bytes"] == 0
+            and not filtered_ops
+            and not filtered_locks
+        ):
+            continue
+
+        top_ops = sorted(filtered_ops.items(), key=lambda x: x[1], reverse=True)[:3]
+        if top_ops:
+            top_ops_details = ",".join(
+                [
+                    f"{c_cyan(OP_MAP.get(op, op))}:{c_white(int(round(count/interval_for_calc)))}"
+                    for op, count in top_ops
+                ]
+            )
+            top_ops_str = f"{c_bwhite(int(round(total_reqs/interval_for_calc)))} ({top_ops_details})"
+        else:
+            top_ops_str = c_grey("0")
+
+        if total_locks > 0:
+            max_op_orig, max_val = max(filtered_locks.items(), key=lambda x: x[1])
+            max_op = OP_MAP.get(max_op_orig, max_op_orig.replace("ldlm_", ""))
+            max_val_ps = int(round(max_val / interval_for_calc))
+            top_locks_str = f"{c_bwhite(int(round(total_locks/interval_for_calc)))} ({c_cyan(max_op)}:{c_white(max_val_ps)})"
+            top_locks_padded = f"{top_locks_str:<51}"
+        else:
+            top_locks_str = c_grey("0")
+            top_locks_padded = f"{top_locks_str:<31}"
+
+        sorted_stats.append(
+            (
+                ip,
+                wr_mbps,
+                rd_mbps,
+                top_locks_padded,
+                total_locks,
+                top_ops_str,
+                total_reqs,
+            )
+        )
+
+    if current_sort == "write":
+        sorted_stats.sort(key=lambda x: (x[1], x[6]), reverse=True)
+    elif current_sort == "read":
+        sorted_stats.sort(key=lambda x: (x[2], x[6]), reverse=True)
+    elif current_sort == "rw":
+        sorted_stats.sort(key=lambda x: (x[1] + x[2], x[6]), reverse=True)
+    elif current_sort == "lock":
+        sorted_stats.sort(key=lambda x: (x[4], x[6]), reverse=True)
+    else:  # Default: 'req'
+        sorted_stats.sort(key=lambda x: (x[6], x[4], x[1], x[2]), reverse=True)
+
+    print_count = 0
+    for stat in sorted_stats:
+        if limit and print_count >= limit:
+            break
+        (
+            ip,
+            wr_mbps,
+            rd_mbps,
+            top_locks_padded,
+            total_locks,
+            top_ops_str,
+            total_reqs,
+        ) = stat
+        print(
+            f"{c_green(f'{ip:<18}')} {c_yellow(f'{wr_mbps:<12.1f}')} {c_yellow(f'{rd_mbps:<12.1f}')} {top_locks_padded} {top_ops_str}"
+        )
+        print_count += 1
+
+    sys.stdout.flush()
+
+
+def ui_loop():
+    fd = sys.stdin.fileno()
+    old_settings = None
+    prompt_mode = False
+
+    try:
+        is_tty = os.isatty(fd)
+    except Exception:
+        is_tty = False
+
+    if is_tty:
+        # Retry termios calls if interrupted by signal
+        for _ in range(3):
+            try:
+                old_settings = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+                os.set_blocking(fd, False)
+                break
+            except termios.error as e:
+                if e.args[0] == 4:  # EINTR
+                    time.sleep(0.1)
+                    continue
+                raise
+            except Exception:
+                is_tty = False
+                break
+
+    try:
+        while not ui_state["quit_flag"]:
+            if ui_state["data_ready"].wait(0.1):
+                ui_state["data_ready"].clear()
+                if not prompt_mode:
+                    redraw_screen()
+
+            r, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if r:
+                c = sys.stdin.read(1)
+                if not c:
+                    continue
+
+                if prompt_mode:
+                    prompt_mode = False
+                    with ui_state["lock"]:
+                        if c == "1":
+                            ui_state["current_sort"] = "write"
+                        elif c == "2":
+                            ui_state["current_sort"] = "read"
+                        elif c == "3":
+                            ui_state["current_sort"] = "rw"
+                        elif c == "4":
+                            ui_state["current_sort"] = "lock"
+                        elif c == "5":
+                            ui_state["current_sort"] = "req"
+
+                    if c in "12345":
+                        print(c, flush=True)
+                        redraw_screen()
+                    elif c in ("\n", "\r"):
+                        print("", flush=True)
+                    else:
+                        print(f"{c}\n{c_red(f'Invalid option {c!r}.')}", flush=True)
+                else:
+                    if c == "s":
+                        prompt_mode = True
+                        print(
+                            "\nSort by: [1]write [2]read [3]rw [4]lock [5]req ? ",
+                            end="",
+                            flush=True,
+                        )
+                    elif c == "q":
+                        os.kill(os.getpid(), signal.SIGINT)
+                        break
+
+    except Exception:
+        pass
+    finally:
+        if is_tty and old_settings:
+            try:
+                os.set_blocking(fd, True)
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
 
 
 OP_MAP = {
@@ -495,11 +723,7 @@ OP_MAP = {
 }
 
 
-async def main_loop(
-    workers, interval, threshold, limit, print_header, sort_by, total_servers
-):
-    current_sort = sort_by
-    is_first = True
+async def main_loop(workers, interval):
     loop = asyncio.get_event_loop()
 
     async def get_msg(w):
@@ -523,20 +747,26 @@ async def main_loop(
         finally:
             loop.remove_reader(fd)
 
-    print(
-        f"Initializing persistent SSH connections to {total_servers} servers across {len(workers)} worker processes..."
-    )
+    # Initial wait for workers to be ready
     await asyncio.gather(*[get_msg(w) for w in workers])
-    clear_screen()
 
+    next_fetch = time.time()
     while True:
+        # Maintain steady interval cadence
+        now = time.time()
+        wait_time = next_fetch - now
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+        next_fetch = time.time() + interval
+
         curl_timeout = max(5, interval - 2)
         for w in workers:
             w["pipe"].send(("fetch", curl_timeout))
 
         results = await asyncio.gather(*[get_msg(w) for w in workers])
 
-        all_stats = defaultdict(
+        # Aggregate results into ui_state
+        new_stats = defaultdict(
             lambda: {
                 "wr_bytes": 0,
                 "rd_bytes": 0,
@@ -544,211 +774,25 @@ async def main_loop(
                 "locks": defaultdict(int),
             }
         )
-        all_errors = []
-        global_max_fetch_time = 0.0
+        new_errors = []
+        new_max_fetch_time = 0.0
 
         for msg, stats, errors, max_fetch_time in results:
-            global_max_fetch_time = max(global_max_fetch_time, max_fetch_time)
-            all_errors.extend(errors)
+            new_max_fetch_time = max(new_max_fetch_time, max_fetch_time)
+            new_errors.extend(errors)
             for client, c_stats in stats.items():
-                all_stats[client]["wr_bytes"] += c_stats["wr_bytes"]
-                all_stats[client]["rd_bytes"] += c_stats["rd_bytes"]
+                new_stats[client]["wr_bytes"] += c_stats["wr_bytes"]
+                new_stats[client]["rd_bytes"] += c_stats["rd_bytes"]
                 for op, count in c_stats["ops"].items():
-                    all_stats[client]["ops"][op] += count
+                    new_stats[client]["ops"][op] += count
                 for lock, count in c_stats["locks"].items():
-                    all_stats[client]["locks"][lock] += count
+                    new_stats[client]["locks"][lock] += count
 
-        if not is_first:
-            clear_screen()
-
-            if print_header:
-                warning = ""
-                if global_max_fetch_time > interval:
-                    warning = " " + c_red("[WARNING: Fetch time exceeds interval!]")
-
-                print(
-                    f"{c_bgrey(f'Servers: {total_servers} | Max Fetch Time: {global_max_fetch_time:.2f}s | Interval: {interval}s | Sort: {current_sort}')}{warning}"
-                )
-
-                if all_errors:
-                    err_msg = ", ".join(f"{srv}: {err}" for srv, err in all_errors[:3])
-                    if len(all_errors) > 3:
-                        err_msg += f" ... (+{len(all_errors)-3} more)"
-                    print(c_red(f"Errors ({len(all_errors)}): {err_msg}"))
-
-                print(
-                    c_bcyan(
-                        f"{'CLIENT_IP':<18} {'WRITE(MBps)':<12} {'READ(MBps)':<12} {'LOCK(ops)':<22} REQ(ops)"
-                    )
-                )
-
-            sorted_stats = []
-            for ip, stats in all_stats.items():
-                interval_for_calc = interval if interval > 0 else 1
-                wr_mbps = (stats["wr_bytes"] / 1048576.0) / interval_for_calc
-                rd_mbps = (stats["rd_bytes"] / 1048576.0) / interval_for_calc
-
-                filtered_ops = {k: v for k, v in stats["ops"].items() if v >= threshold}
-                total_reqs = sum(filtered_ops.values())
-
-                filtered_locks = {
-                    k: v for k, v in stats["locks"].items() if v >= threshold
-                }
-                total_locks = sum(filtered_locks.values())
-
-                if (
-                    stats["wr_bytes"] == 0
-                    and stats["rd_bytes"] == 0
-                    and not filtered_ops
-                    and not filtered_locks
-                ):
-                    continue
-
-                top_ops = sorted(
-                    filtered_ops.items(), key=lambda x: x[1], reverse=True
-                )[:3]
-                if top_ops:
-                    top_ops_details = ",".join(
-                        [
-                            f"{c_cyan(OP_MAP.get(op, op))}:{c_white(int(round(count/interval_for_calc)))}"
-                            for op, count in top_ops
-                        ]
-                    )
-                    top_ops_str = f"{c_bwhite(int(round(total_reqs/interval_for_calc)))} ({top_ops_details})"
-                else:
-                    top_ops_str = c_grey("0")
-
-                if total_locks > 0:
-                    max_op_orig, max_val = max(
-                        filtered_locks.items(), key=lambda x: x[1]
-                    )
-                    max_op = OP_MAP.get(max_op_orig, max_op_orig.replace("ldlm_", ""))
-                    max_val_ps = int(round(max_val / interval_for_calc))
-                    top_locks_str = f"{c_bwhite(int(round(total_locks/interval_for_calc)))} ({c_cyan(max_op)}:{c_white(max_val_ps)})"
-                    top_locks_padded = f"{top_locks_str:<51}"
-                else:
-                    top_locks_str = c_grey("0")
-                    top_locks_padded = f"{top_locks_str:<31}"
-
-                sorted_stats.append(
-                    (
-                        ip,
-                        wr_mbps,
-                        rd_mbps,
-                        top_locks_padded,
-                        total_locks,
-                        top_ops_str,
-                        total_reqs,
-                    )
-                )
-
-            if current_sort == "write":
-                sorted_stats.sort(key=lambda x: (x[1], x[6]), reverse=True)
-            elif current_sort == "read":
-                sorted_stats.sort(key=lambda x: (x[2], x[6]), reverse=True)
-            elif current_sort == "rw":
-                sorted_stats.sort(key=lambda x: (x[1] + x[2], x[6]), reverse=True)
-            elif current_sort == "lock":
-                sorted_stats.sort(key=lambda x: (x[4], x[6]), reverse=True)
-            else:  # Default: 'req'
-                sorted_stats.sort(key=lambda x: (x[6], x[4], x[1], x[2]), reverse=True)
-
-            print_count = 0
-            for stat in sorted_stats:
-                if limit and print_count >= limit:
-                    break
-                (
-                    ip,
-                    wr_mbps,
-                    rd_mbps,
-                    top_locks_padded,
-                    total_locks,
-                    top_ops_str,
-                    total_reqs,
-                ) = stat
-                print(
-                    f"{c_green(f'{ip:<18}')} {c_yellow(f'{wr_mbps:<12.1f}')} {c_yellow(f'{rd_mbps:<12.1f}')} {top_locks_padded} {top_ops_str}"
-                )
-                print_count += 1
-
-            sys.stdout.flush()
-
-            waited = 0.0
-            prompt_mode = False
-
-            def check_stdin():
-                nonlocal current_sort, prompt_mode, waited
-                try:
-                    c = sys.stdin.read(1)
-                    if not c:
-                        return
-                    if prompt_mode:
-                        prompt_mode = False
-                        if c == "1":
-                            current_sort = "write"
-                        elif c == "2":
-                            current_sort = "read"
-                        elif c == "3":
-                            current_sort = "rw"
-                        elif c == "4":
-                            current_sort = "lock"
-                        elif c == "5":
-                            current_sort = "req"
-
-                        if c in "12345":
-                            print(c, flush=True)
-                            waited = interval  # Force refresh
-                        elif c in ("\n", "\r"):
-                            print("", flush=True)
-                        else:
-                            print(f"{c}\n{c_red(f'Invalid option {c!r}.')}", flush=True)
-                            waited = interval
-                    else:
-                        if c == "s":
-                            prompt_mode = True
-                            print(
-                                "\nSort by: [1]write [2]read [3]rw [4]lock [5]req ? ",
-                                end="",
-                                flush=True,
-                            )
-                        elif c == "q":
-                            raise KeyboardInterrupt
-                except Exception as e:
-                    if isinstance(e, KeyboardInterrupt):
-                        raise
-
-            fd = sys.stdin.fileno()
-            try:
-                is_tty = os.isatty(fd)
-            except Exception:
-                is_tty = False
-
-            if is_tty:
-                try:
-                    old_settings = termios.tcgetattr(fd)
-                    tty.setcbreak(fd)
-                    os.set_blocking(fd, False)
-                    loop = asyncio.get_event_loop()
-                    loop.add_reader(fd, check_stdin)
-                except Exception:
-                    is_tty = False
-
-            try:
-                while waited < interval or prompt_mode:
-                    await asyncio.sleep(0.1)
-                    if not prompt_mode:
-                        waited += 0.1
-            finally:
-                if is_tty:
-                    try:
-                        loop.remove_reader(fd)
-                        os.set_blocking(fd, True)
-                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                    except Exception:
-                        pass
-        else:
-            is_first = False
-            await asyncio.sleep(interval)
+        with ui_state["lock"]:
+            ui_state["all_stats"] = new_stats
+            ui_state["all_errors"] = new_errors
+            ui_state["global_max_fetch_time"] = new_max_fetch_time
+            ui_state["data_ready"].set()
 
 
 def main():
@@ -851,6 +895,19 @@ Output Abbreviations:
         print(f"No servers found for targets: {args.targets}", file=sys.stderr)
         sys.exit(1)
 
+    # Initialize shared UI state
+    with ui_state["lock"]:
+        ui_state["interval"] = args.interval
+        ui_state["threshold"] = args.threshold
+        ui_state["limit"] = args.limit
+        ui_state["print_header"] = not args.no_header
+        ui_state["current_sort"] = args.sort_by
+        ui_state["total_servers"] = len(servers)
+
+    # Start UI thread
+    ui_thread = threading.Thread(target=ui_loop, daemon=True)
+    ui_thread.start()
+
     num_workers = min(args.workers, len(servers))
     chunk_size = (len(servers) + num_workers - 1) // num_workers
     workers = []
@@ -873,21 +930,12 @@ Output Abbreviations:
             f"Collecting baseline metrics... (first refresh in {args.interval}s)",
             file=sys.stderr,
         )
-        main_task = asyncio.ensure_future(
-            main_loop(
-                workers,
-                args.interval,
-                args.threshold,
-                args.limit,
-                not args.no_header,
-                args.sort_by,
-                len(servers),
-            )
-        )
+        main_task = asyncio.ensure_future(main_loop(workers, args.interval))
         loop.run_until_complete(main_task)
     except KeyboardInterrupt:
         pass
     finally:
+        ui_state["quit_flag"] = True
         # Ignore signals during cleanup
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGCHLD):
             try:
