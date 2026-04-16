@@ -390,6 +390,27 @@ def process_metrics(server, metrics_text, history, current_stats, is_first):
                     current_stats[current_client]["ops"][op] += diff
 
 
+async def async_recv(loop, pipe):
+    fut = loop.create_future()
+    fd = pipe.fileno()
+
+    def reader():
+        if pipe.poll():
+            if not fut.done():
+                try:
+                    fut.set_result(pipe.recv())
+                except EOFError:
+                    fut.set_exception(EOFError())
+                except Exception as e:
+                    fut.set_exception(e)
+
+    loop.add_reader(fd, reader)
+    try:
+        return await fut
+    finally:
+        loop.remove_reader(fd)
+
+
 async def worker_loop(servers, params_str, pipe, ssh_cmd):
     history = {}
     is_first = True
@@ -405,29 +426,9 @@ async def worker_loop(servers, params_str, pipe, ssh_cmd):
     loop = asyncio.get_event_loop()
     pipe.send(("ready",))
 
-    async def get_pipe_msg():
-        fut = loop.create_future()
-        fd = pipe.fileno()
-
-        def reader():
-            if pipe.poll():
-                if not fut.done():
-                    try:
-                        fut.set_result(pipe.recv())
-                    except EOFError:
-                        fut.set_exception(EOFError())
-                    except Exception as e:
-                        fut.set_exception(e)
-
-        loop.add_reader(fd, reader)
-        try:
-            return await fut
-        finally:
-            loop.remove_reader(fd)
-
     while True:
         try:
-            cmd = await get_pipe_msg()
+            cmd = await async_recv(loop, pipe)
         except EOFError:
             break
 
@@ -726,29 +727,8 @@ OP_MAP = {
 async def main_loop(workers, interval):
     loop = asyncio.get_event_loop()
 
-    async def get_msg(w):
-        fut = loop.create_future()
-        p = w["pipe"]
-        fd = p.fileno()
-
-        def reader():
-            if p.poll():
-                if not fut.done():
-                    try:
-                        fut.set_result(p.recv())
-                    except EOFError:
-                        fut.set_exception(EOFError())
-                    except Exception as e:
-                        fut.set_exception(e)
-
-        loop.add_reader(fd, reader)
-        try:
-            return await fut
-        finally:
-            loop.remove_reader(fd)
-
     # Initial wait for workers to be ready
-    await asyncio.gather(*[get_msg(w) for w in workers])
+    await asyncio.gather(*[async_recv(loop, w["pipe"]) for w in workers])
 
     next_fetch = time.time()
     while True:
@@ -763,7 +743,7 @@ async def main_loop(workers, interval):
         for w in workers:
             w["pipe"].send(("fetch", curl_timeout))
 
-        results = await asyncio.gather(*[get_msg(w) for w in workers])
+        results = await asyncio.gather(*[async_recv(loop, w["pipe"]) for w in workers])
 
         # Aggregate results into ui_state
         new_stats = defaultdict(
