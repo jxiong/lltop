@@ -504,9 +504,6 @@ def redraw_screen():
         print_header = ui_state["print_header"]
         total_servers = ui_state["total_servers"]
 
-    if not all_stats:
-        return
-
     clear_screen()
 
     if print_header:
@@ -529,6 +526,10 @@ def redraw_screen():
                 f"{'CLIENT_IP':<18} {'WRITE(MBps)':<12} {'READ(MBps)':<12} {'LOCK(ops)':<22} REQ(ops)"
             )
         )
+
+    if not all_stats:
+        sys.stdout.flush()
+        return
 
     sorted_stats = []
     for ip, stats in all_stats.items():
@@ -694,10 +695,14 @@ def ui_loop():
     finally:
         if is_tty and old_settings:
             try:
-                os.set_blocking(fd, True)
+                # Restore original terminal settings
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                os.set_blocking(fd, True)
             except Exception:
                 pass
+        # Final newline to leave shell prompt clean
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 OP_MAP = {
@@ -728,7 +733,17 @@ async def main_loop(workers, interval):
     loop = asyncio.get_event_loop()
 
     # Initial wait for workers to be ready
+    print(
+        f"Initializing persistent SSH connections to {ui_state['total_servers']} servers across {len(workers)} worker processes...",
+        file=sys.stderr,
+    )
     await asyncio.gather(*[async_recv(loop, w["pipe"]) for w in workers])
+
+    # Signal UI thread to show the initial empty screen while collecting baseline
+    with ui_state["lock"]:
+        ui_state["data_ready"].set()
+
+    print("All workers ready. Collecting baseline metrics...", file=sys.stderr)
 
     next_fetch = time.time()
     while True:
@@ -737,7 +752,11 @@ async def main_loop(workers, interval):
         wait_time = next_fetch - now
         if wait_time > 0:
             await asyncio.sleep(wait_time)
-        next_fetch = time.time() + interval
+        else:
+            # We are late, don't let next_fetch fall behind
+            next_fetch = now
+
+        next_fetch += interval
 
         curl_timeout = max(5, interval - 2)
         for w in workers:
@@ -885,7 +904,7 @@ Output Abbreviations:
         ui_state["total_servers"] = len(servers)
 
     # Start UI thread
-    ui_thread = threading.Thread(target=ui_loop, daemon=True)
+    ui_thread = threading.Thread(target=ui_loop)
     ui_thread.start()
 
     num_workers = min(args.workers, len(servers))
@@ -916,6 +935,10 @@ Output Abbreviations:
         pass
     finally:
         ui_state["quit_flag"] = True
+        ui_state["data_ready"].set()
+        if "ui_thread" in locals():
+            ui_thread.join(timeout=2)
+
         # Ignore signals during cleanup
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGCHLD):
             try:
